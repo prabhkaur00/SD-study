@@ -1,0 +1,23 @@
+model: meta-llama/Llama-3.1-8B-Instruct
+max_input_tokens: 512
+max_output_tokens: 512
+max_model_len: 1088          # 512 + 512 + 64 slack
+temperature: 0
+gpu_memory_utilization: 0.9
+n_prompts: 100
+
+methods:
+  - name: none
+    gammas: [null]            # gamma is ignored for vanilla decoding
+  - name: ngram
+    gammas: [1, 3, 5]
+
+batch_sizes: [1, 8]
+
+datasets:
+  - instructcoder
+  - sharegpt
+
+# ngram-specific (carried here for documentation; set in runner.py)
+prompt_lookup_max: 7
+prompt_lookup_min: 3
