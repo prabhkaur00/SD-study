@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.datasets import load_prompts, get_tokenizer
+from src.dataset import load_prompts, get_tokenizer
 from src.runner import run_one
 
 MODEL_ID = os.environ.get("HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
