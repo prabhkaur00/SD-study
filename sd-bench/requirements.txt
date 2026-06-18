@@ -3,5 +3,6 @@ pandas>=2.0
 datasets>=2.14
 pyyaml>=6.0
 tqdm>=4.65
-transformers>=4.40
+transformers>=4.45.0,<5.0.0   # vLLM 0.10.x incompatible with transformers 5.x
+tokenizers>=0.19.0,<0.22.0
 torch>=2.1

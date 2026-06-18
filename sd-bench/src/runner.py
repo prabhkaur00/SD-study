@@ -1,4 +1,4 @@
-"""Build a vLLM LLMEngine for one config, run prompts, return metrics + outputs."""
+"""Build a vLLM LLM for one config, run prompts, return metrics + outputs."""
 import gc
 import json
 import math
@@ -10,7 +10,7 @@ from typing import Optional
 MODEL_ID = os.environ.get("HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 
 
-def _build_engine(
+def _build_llm(
     method: str,
     gamma: Optional[int],
     model_id: str,
@@ -19,21 +19,27 @@ def _build_engine(
     max_num_seqs: int,
 ):
     """
-    Create LLMEngine, using the vLLM 0.10.x speculative_config dict API.
-    Falls back to the legacy flat-param API if speculative_config is rejected.
+    Create a vLLM LLM instance (not LLMEngine) so that get_metrics() is
+    available for V1 spec-decode stats.  Probes the constructor signature
+    before passing each optional kwarg so version-specific removals don't crash.
     """
-    from vllm import LLMEngine
-    from vllm.engine.arg_utils import EngineArgs
+    from vllm import LLM
+    import inspect
 
-    base = dict(
-        model=model_id,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_util,
-        max_num_seqs=max_num_seqs,
-        disable_log_stats=False,
-        disable_log_requests=True,
-        trust_remote_code=False,
-    )
+    _params = set(inspect.signature(LLM.__init__).parameters)
+
+    def _maybe(key, val):
+        return {key: val} if key in _params else {}
+
+    base = {
+        "model": model_id,
+        "max_model_len": max_model_len,
+        "gpu_memory_utilization": gpu_util,
+        "max_num_seqs": max_num_seqs,
+        "trust_remote_code": False,
+        **_maybe("dtype", "float16"),         # T4 prefers fp16 over bfloat16
+        **_maybe("disable_log_stats", False),
+    }
 
     if method == "ngram":
         spec_cfg = {
@@ -43,10 +49,10 @@ def _build_engine(
             "prompt_lookup_min": 3,
         }
         try:
-            ea = EngineArgs(**base, speculative_config=spec_cfg)
+            return LLM(**base, speculative_config=spec_cfg)
         except TypeError:
             # Pre-0.6 flat API
-            ea = EngineArgs(
+            return LLM(
                 **base,
                 speculative_model="[ngram]",
                 num_speculative_tokens=gamma,
@@ -54,9 +60,7 @@ def _build_engine(
                 ngram_prompt_lookup_min=3,
             )
     else:
-        ea = EngineArgs(**base)
-
-    return LLMEngine.from_engine_args(ea)
+        return LLM(**base)
 
 
 def run_one(
@@ -75,21 +79,15 @@ def run_one(
 ) -> tuple:
     """
     Run a single benchmarking configuration.
-
     Returns (metrics_row: dict, outputs: list[RequestOutput]).
-    The metrics_row is ready to be written to runs.csv.
-    baseline_throughput_tok_per_sec and speedup are left as NaN — the sweep
-    script fills them post-hoc once the matching 'none' run is available.
     """
     from vllm import SamplingParams
-    # Support both "python scripts/smoke_test.py" (sd-bench on sys.path)
-    # and direct invocation from inside src/.
     try:
-        from src.metrics import build_metrics_row, extract_kv_usage_from_engine
+        from src.metrics import build_metrics_row, extract_spec_decode_stats_v1, extract_kv_usage_from_engine
     except ModuleNotFoundError:
-        from metrics import build_metrics_row, extract_kv_usage_from_engine  # type: ignore
+        from metrics import build_metrics_row, extract_spec_decode_stats_v1, extract_kv_usage_from_engine  # type: ignore
 
-    engine = _build_engine(method, gamma, model_id, max_model_len, gpu_util, batch_size)
+    llm = _build_llm(method, gamma, model_id, max_model_len, gpu_util, batch_size)
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -97,35 +95,26 @@ def run_one(
         ignore_eos=False,
     )
 
-    for p in prompts:
-        engine.add_request(p["prompt_id"], p["text"], sampling_params)
-
-    completed: dict = {}
-    step_kv_usages: list = []
-    num_preemptions = 0
+    # LLM.generate() preserves input order, so zip(prompts, outputs) is safe
+    prompt_texts = [p["text"] for p in prompts]
 
     t0 = time.perf_counter()
-    while engine.has_unfinished_requests():
-        step_outputs = engine.step()
-
-        kv = extract_kv_usage_from_engine(engine)
-        if not math.isnan(kv):
-            step_kv_usages.append(kv)
-
-        for out in step_outputs:
-            if out.finished:
-                completed[out.request_id] = out
-
+    outputs = llm.generate(prompt_texts, sampling_params)
     wall_time = time.perf_counter() - t0
 
-    # Restore original prompt order; warn if any prompt is missing
-    outputs = []
-    for p in prompts:
-        out = completed.get(p["prompt_id"])
-        if out is None:
-            print(f"[runner] Warning: no output for prompt {p['prompt_id']}")
-        else:
-            outputs.append(out)
+    # Pull spec-decode stats while the model is still loaded (cumulative since init)
+    sd_stats = extract_spec_decode_stats_v1(llm)
+
+    # Single KV cache sample post-generation via the underlying engine
+    step_kv_usages = []
+    try:
+        engine = getattr(llm, "llm_engine", None)
+        if engine is not None:
+            kv = extract_kv_usage_from_engine(engine)
+            if not math.isnan(kv):
+                step_kv_usages = [kv]
+    except Exception:
+        pass
 
     if raw_dir is not None:
         _write_raw(run_id, prompts, outputs, step_kv_usages, raw_dir)
@@ -139,13 +128,11 @@ def run_one(
         n_prompts=len(outputs),
         wall_time=wall_time,
         outputs=outputs,
-        engine=engine,
+        sd_stats=sd_stats,
         step_kv_usages=step_kv_usages,
-        num_preemptions=num_preemptions,
     )
 
-    # Free GPU memory before returning
-    del engine
+    del llm
     gc.collect()
     try:
         import torch
@@ -163,7 +150,6 @@ def _write_raw(
     step_kv_usages: list,
     raw_dir: Path,
 ) -> None:
-    """Write per-run JSON with per-request detail + KV time-series."""
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -173,7 +159,6 @@ def _write_raw(
         arrival = getattr(m, "arrival_time", None) if m else None
         finished = getattr(m, "finished_time", None) if m else None
         first_tok = getattr(m, "first_token_time", None) if m else None
-
         gen_len = sum(len(o.token_ids) for o in out.outputs)
         per_request.append({
             "prompt_id": p["prompt_id"],
@@ -181,14 +166,9 @@ def _write_raw(
             "output_len": gen_len,
             "latency": (finished - arrival) if (arrival and finished) else None,
             "ttft": (first_tok - arrival) if (arrival and first_tok) else None,
-            # per-request per-step accepted lengths are not exposed by vLLM offline API
-            "accepted_length_per_step_list": [],
+            "accepted_length_per_step_list": [],  # not exposed by vLLM offline API
         })
 
-    data = {
-        "run_id": run_id,
-        "per_request": per_request,
-        "kv_utilization_timeseries": step_kv_usages,
-    }
     with open(raw_dir / f"{run_id}.json", "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump({"run_id": run_id, "per_request": per_request,
+                   "kv_utilization_timeseries": step_kv_usages}, f, indent=2)

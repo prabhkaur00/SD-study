@@ -64,7 +64,7 @@ def extract_request_metrics(outputs: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# KV cache usage — sampled once per engine.step() call
+# KV cache usage
 # ---------------------------------------------------------------------------
 
 def extract_kv_usage_from_engine(engine) -> float:
@@ -72,7 +72,7 @@ def extract_kv_usage_from_engine(engine) -> float:
     Sample current GPU KV-cache utilization as a fraction in [0, 1].
     Returns NaN when the internal path is unavailable.
     """
-    # Attempt 1: scheduler block_manager (most common path in 0.7-0.10)
+    # Attempt 1: scheduler block_manager
     try:
         sched = engine.scheduler
         if isinstance(sched, list):
@@ -87,7 +87,7 @@ def extract_kv_usage_from_engine(engine) -> float:
     except Exception:
         pass
 
-    # Attempt 2: scheduler.get_stats() if available
+    # Attempt 2: scheduler.get_stats()
     try:
         sched = engine.scheduler
         if isinstance(sched, list):
@@ -123,15 +123,23 @@ def extract_kv_usage_from_engine(engine) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Speculative-decode stats from engine internals
+# Speculative-decode stats — V1 engine path (vLLM 0.6+)
 # ---------------------------------------------------------------------------
 
-def extract_spec_decode_stats(engine, step_kv_usages: list) -> dict:
+def extract_spec_decode_stats_v1(llm) -> dict:
     """
-    Best-effort extraction of speculative-decoding metrics.
-    All unavailable fields are NaN — never silently dropped.
+    Extract spec-decode counters from LLM.get_metrics() (vLLM V1 engine).
+
+    vLLM V1 exposes cumulative Prometheus-style counters via get_metrics().
+    Calling this after generate() and before deleting the LLM instance gives
+    totals for the entire run (safe because we create a fresh LLM per config).
+
+    Counter names used:
+      vllm:spec_decode_num_drafts            — total draft rounds
+      vllm:spec_decode_num_draft_tokens      — total tokens proposed
+      vllm:spec_decode_num_accepted_tokens   — total tokens accepted
     """
-    result = {
+    empty = {
         "total_drafted_tokens": _NAN,
         "total_accepted_tokens": _NAN,
         "acceptance_rate": _NAN,
@@ -144,79 +152,57 @@ def extract_spec_decode_stats(engine, step_kv_usages: list) -> dict:
         "time_verification_frac": _NAN,
         "time_sampling_frac": _NAN,
         "time_overhead_frac": _NAN,
+        "peak_kv_cache_usage_pct": _NAN,
+        "mean_kv_cache_usage_pct": _NAN,
     }
 
-    # Attempt: stat_loggers (Prometheus-style counters collected per-step)
     try:
-        loggers = getattr(engine, "stat_loggers", None) or {}
-        for logger in loggers.values():
-            raw = getattr(logger, "_metrics", None) or getattr(logger, "metrics", None) or {}
-            for key, val in raw.items():
-                k = key.lower()
-                if "acceptance_rate" in k or "draft_acceptance" in k:
-                    result["acceptance_rate"] = float(val)
-                if "num_accepted" in k or "accepted_tokens" in k:
-                    result["total_accepted_tokens"] = float(val)
-                if "num_draft" in k or "draft_tokens" in k or "proposed" in k:
-                    result["total_drafted_tokens"] = float(val)
-    except Exception:
-        pass
+        raw_metrics = llm.get_metrics()
+    except AttributeError:
+        return empty
+    if not raw_metrics:
+        return empty
 
-    # Attempt: spec_decode_worker accumulated counters
-    try:
-        executor = engine.model_executor
-        driver = getattr(executor, "driver_worker", None)
-        if driver is None:
-            workers = getattr(executor, "workers", [])
-            if workers:
-                driver = workers[0]
-        if driver is not None:
-            sdw = None
-            for attr in ("spec_decode_worker", "_spec_decode_worker"):
-                sdw = getattr(driver, attr, None)
-                if sdw is not None:
-                    break
-            if sdw is not None:
-                metrics_obj = getattr(sdw, "metrics", None) or getattr(sdw, "_metrics", None)
-                if isinstance(metrics_obj, dict):
-                    result["total_drafted_tokens"] = float(
-                        metrics_obj.get("num_spec_tokens_proposed", _NAN)
-                    )
-                    result["total_accepted_tokens"] = float(
-                        metrics_obj.get("num_spec_tokens_accepted", _NAN)
-                    )
-                elif metrics_obj is not None:
-                    for field in ("num_spec_tokens_proposed", "num_draft_tokens", "drafted"):
-                        v = getattr(metrics_obj, field, None)
-                        if v is not None:
-                            result["total_drafted_tokens"] = float(v)
-                            break
-                    for field in ("num_spec_tokens_accepted", "accepted"):
-                        v = getattr(metrics_obj, field, None)
-                        if v is not None:
-                            result["total_accepted_tokens"] = float(v)
-                            break
-    except Exception:
-        pass
+    # Build name -> scalar value dict.
+    # vLLM metric objects vary across builds: dataclass with .name/.value,
+    # or plain dicts. Handle both.
+    by_name: dict = {}
+    for m in raw_metrics:
+        name = getattr(m, "name", None) or (m.get("name") if isinstance(m, dict) else None)
+        if name is None:
+            continue
+        value = getattr(m, "value", None)
+        if value is None and isinstance(m, dict):
+            value = m.get("value")
+        # Some builds use .labels_and_values for labeled counters — skip those for now
+        if value is not None:
+            by_name[name] = value
 
-    # Derive acceptance_rate if we have both parts
-    drafted = result["total_drafted_tokens"]
-    accepted = result["total_accepted_tokens"]
-    if not math.isnan(drafted) and not math.isnan(accepted) and drafted > 0:
-        result["acceptance_rate"] = accepted / drafted
+    def _get(key: str) -> float:
+        v = by_name.get(key)
+        if v is None:
+            return _NAN
+        try:
+            f = float(v)
+            return f if not math.isnan(f) else _NAN
+        except (TypeError, ValueError):
+            return _NAN
 
-    # KV cache stats from the per-step samples collected in the run loop
-    if step_kv_usages:
-        pct_samples = [v * 100 for v in step_kv_usages if not math.isnan(v)]
-        if pct_samples:
-            result["peak_kv_cache_usage_pct"] = max(pct_samples)
-            result["mean_kv_cache_usage_pct"] = sum(pct_samples) / len(pct_samples)
-        else:
-            result["peak_kv_cache_usage_pct"] = _NAN
-            result["mean_kv_cache_usage_pct"] = _NAN
-    else:
-        result["peak_kv_cache_usage_pct"] = _NAN
-        result["mean_kv_cache_usage_pct"] = _NAN
+    num_drafts = _get("vllm:spec_decode_num_drafts")
+    num_draft_tokens = _get("vllm:spec_decode_num_draft_tokens")
+    num_accepted = _get("vllm:spec_decode_num_accepted_tokens")
+
+    result = dict(empty)  # start from NaN defaults
+
+    if not math.isnan(num_draft_tokens):
+        result["total_drafted_tokens"] = num_draft_tokens
+        result["total_accepted_tokens"] = num_accepted if not math.isnan(num_accepted) else _NAN
+        if num_draft_tokens > 0 and not math.isnan(num_accepted):
+            result["acceptance_rate"] = num_accepted / num_draft_tokens
+
+    if not math.isnan(num_drafts) and num_drafts > 0 and not math.isnan(num_accepted):
+        # +1: the target model always emits one bonus token per draft round
+        result["mean_accepted_length_per_step"] = 1.0 + num_accepted / num_drafts
 
     return result
 
@@ -234,7 +220,7 @@ def build_metrics_row(
     n_prompts: int,
     wall_time: float,
     outputs: list,
-    engine,
+    sd_stats: dict,
     step_kv_usages: list,
     num_preemptions: int = 0,
     status: str = "ok",
@@ -250,13 +236,17 @@ def build_metrics_row(
         gpu_name = "unknown"
 
     req_m = extract_request_metrics(outputs)
-    sd_m = extract_spec_decode_stats(engine, step_kv_usages)
+
+    # Merge KV cache samples into sd_stats
+    if step_kv_usages:
+        pct = [v * 100 for v in step_kv_usages if not math.isnan(v)]
+        sd_stats["peak_kv_cache_usage_pct"] = max(pct) if pct else _NAN
+        sd_stats["mean_kv_cache_usage_pct"] = sum(pct) / len(pct) if pct else _NAN
 
     total_out = req_m["total_output_tokens"]
     throughput = total_out / wall_time if wall_time > 0 else _NAN
 
     return {
-        # Identifiers
         "run_id": run_id,
         "method": method,
         "gamma": gamma if gamma is not None else _NAN,
@@ -266,40 +256,33 @@ def build_metrics_row(
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "vllm_version": vllm.__version__,
         "gpu_name": gpu_name,
-        # Throughput
         "throughput_tok_per_sec": throughput,
-        "baseline_throughput_tok_per_sec": _NAN,  # filled post-hoc by sweep
-        "speedup": _NAN,                           # filled post-hoc by sweep
+        "baseline_throughput_tok_per_sec": _NAN,
+        "speedup": _NAN,
         "total_output_tokens": total_out,
         "total_wall_time_sec": wall_time,
-        # Acceptance
-        "total_drafted_tokens": sd_m["total_drafted_tokens"],
-        "total_accepted_tokens": sd_m["total_accepted_tokens"],
-        "acceptance_rate": sd_m["acceptance_rate"],
-        "mean_accepted_length_per_step": sd_m["mean_accepted_length_per_step"],
-        "accepted_length_std": sd_m["accepted_length_std"],
-        "accepted_length_p5": sd_m["accepted_length_p5"],
-        "accepted_length_p50": sd_m["accepted_length_p50"],
-        "accepted_length_p95": sd_m["accepted_length_p95"],
-        # Time breakdown
-        "time_drafting_frac": sd_m["time_drafting_frac"],
-        "time_verification_frac": sd_m["time_verification_frac"],
-        "time_sampling_frac": sd_m["time_sampling_frac"],
-        "time_overhead_frac": sd_m["time_overhead_frac"],
-        # Memory
-        "peak_kv_cache_usage_pct": sd_m["peak_kv_cache_usage_pct"],
-        "mean_kv_cache_usage_pct": sd_m["mean_kv_cache_usage_pct"],
+        "total_drafted_tokens": sd_stats["total_drafted_tokens"],
+        "total_accepted_tokens": sd_stats["total_accepted_tokens"],
+        "acceptance_rate": sd_stats["acceptance_rate"],
+        "mean_accepted_length_per_step": sd_stats["mean_accepted_length_per_step"],
+        "accepted_length_std": sd_stats["accepted_length_std"],
+        "accepted_length_p5": sd_stats["accepted_length_p5"],
+        "accepted_length_p50": sd_stats["accepted_length_p50"],
+        "accepted_length_p95": sd_stats["accepted_length_p95"],
+        "time_drafting_frac": sd_stats["time_drafting_frac"],
+        "time_verification_frac": sd_stats["time_verification_frac"],
+        "time_sampling_frac": sd_stats["time_sampling_frac"],
+        "time_overhead_frac": sd_stats["time_overhead_frac"],
+        "peak_kv_cache_usage_pct": sd_stats.get("peak_kv_cache_usage_pct", _NAN),
+        "mean_kv_cache_usage_pct": sd_stats.get("mean_kv_cache_usage_pct", _NAN),
         "num_preemptions": num_preemptions,
-        # Latency
         "mean_per_request_latency_sec": req_m["mean_per_request_latency_sec"],
         "p50_latency_sec": req_m["p50_latency_sec"],
         "p95_latency_sec": req_m["p95_latency_sec"],
         "p99_latency_sec": req_m["p99_latency_sec"],
         "mean_ttft_sec": req_m["mean_ttft_sec"],
-        # Generation length
         "mean_generation_length": req_m["mean_generation_length"],
         "std_generation_length": req_m["std_generation_length"],
-        # Status
         "status": status,
         "error_msg": error_msg,
     }
