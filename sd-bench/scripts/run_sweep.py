@@ -240,6 +240,7 @@ def main():
             n_prompts=cfg["n_prompts"],
             max_input_tokens=cfg["max_input_tokens"],
             tokenizer=tok,
+            model_id=model_id,
         )
         print(f"  {len(prompt_cache[ds_name])} prompts ready")
     print()

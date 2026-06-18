@@ -61,6 +61,7 @@ def main():
         n_prompts=SMOKE_N_PROMPTS,
         max_input_tokens=512,
         tokenizer=tok,
+        model_id=MODEL_ID,
     )
     print(f"Loaded {len(prompts)} prompts from {SMOKE_DATASET}\n")
 

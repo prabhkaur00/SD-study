@@ -49,9 +49,21 @@ _EXTRACTORS = {
 }
 
 
-def _cache_key(dataset_name: str, n_prompts: int, max_input_tokens: int, seed: int) -> str:
-    raw = f"{dataset_name}:{n_prompts}:{max_input_tokens}:{seed}"
+def _cache_key(dataset_name: str, n_prompts: int, max_input_tokens: int, seed: int, model_id: str = "") -> str:
+    raw = f"{dataset_name}:{n_prompts}:{max_input_tokens}:{seed}:{model_id}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def apply_chat_template(prompts: list, tokenizer) -> list:
+    """Wrap each prompt's text with the model's chat template in place."""
+    for p in prompts:
+        p["text"] = tokenizer.apply_chat_template(
+            [{"role": "user", "content": p["text"]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        p["input_len"] = len(tokenizer.encode(p["text"], add_special_tokens=False))
+    return prompts
 
 
 def load_prompts(
@@ -60,6 +72,7 @@ def load_prompts(
     max_input_tokens: int = 512,
     seed: int = 42,
     tokenizer=None,
+    model_id: str = MODEL_ID,
     use_cache: bool = True,
 ) -> list:
     """
@@ -71,7 +84,7 @@ def load_prompts(
 
     cache_file = (
         CACHE_DIR
-        / f"{dataset_name}_{_cache_key(dataset_name, n_prompts, max_input_tokens, seed)}.json"
+        / f"{dataset_name}_{_cache_key(dataset_name, n_prompts, max_input_tokens, seed, model_id)}.json"
     )
 
     if use_cache and cache_file.exists():
@@ -127,6 +140,10 @@ def load_prompts(
             f"(wanted {n_prompts}) for {dataset_name}"
         )
 
+    if tokenizer is None:
+        tokenizer = get_tokenizer(model_id)
+    apply_chat_template(result, tokenizer)
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     with open(cache_file, "w") as f:
         json.dump(result, f, indent=2)
@@ -162,6 +179,7 @@ if __name__ == "__main__":
             n_prompts=max(n_sample, 10),
             max_input_tokens=512,
             tokenizer=tok,
+            model_id=MODEL_ID,
         )
         for p in prompts[:n_sample]:
             preview = p["text"][:120].replace("\n", " ")
