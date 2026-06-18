@@ -120,6 +120,20 @@ def _build_llm(
                 ngram_prompt_lookup_max=7,
                 ngram_prompt_lookup_min=3,
             )
+    elif method == "eagle3":
+        spec_cfg = {
+            "method": "eagle3",
+            "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+            "num_speculative_tokens": gamma,
+        }
+        return LLM(**base, speculative_config=spec_cfg)
+    elif method == "draft_model":
+        spec_cfg = {
+            "method": "draft_model",
+            "model": "meta-llama/Llama-3.2-1B-Instruct",
+            "num_speculative_tokens": gamma,
+        }
+        return LLM(**base, speculative_config=spec_cfg)
     else:
         return LLM(**base)
 
@@ -186,13 +200,17 @@ def run_one(
     # Single get_metrics() call — shared across all post-run extractors
     raw_metrics = llm.get_metrics()
 
-    sd_stats = extract_spec_decode_stats_v1(raw_metrics)
+    sd_stats = extract_spec_decode_stats_v1(raw_metrics, gamma=gamma)
     latency_stats = extract_latency_stats(raw_metrics)
     breakdown_stats = extract_time_breakdown(raw_metrics)
     num_preemptions = extract_preemption_count(raw_metrics)
 
     if raw_dir is not None:
-        _write_raw(run_id, prompts, outputs, kv_poller.samples, raw_dir)
+        _write_raw(
+            run_id, prompts, outputs, kv_poller.samples, raw_dir,
+            per_pos_count=sd_stats.get("per_pos_count", []),
+            per_pos_acceptance_rate=sd_stats.get("per_pos_acceptance_rate", []),
+        )
 
     row = build_metrics_row(
         run_id=run_id,
@@ -231,6 +249,8 @@ def _write_raw(
     outputs: list,
     kv_samples: list,
     raw_dir: Path,
+    per_pos_count: Optional[list] = None,
+    per_pos_acceptance_rate: Optional[list] = None,
 ) -> None:
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -252,4 +272,6 @@ def _write_raw(
             "run_id": run_id,
             "per_request": per_request,
             "kv_utilization_timeseries": kv_samples,
+            "per_pos_count": per_pos_count or [],
+            "per_pos_acceptance_rate": per_pos_acceptance_rate or [],
         }, f, indent=2)

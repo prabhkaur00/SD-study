@@ -27,6 +27,8 @@ SMOKE_MAX_MODEL_LEN = 640  # 512 input + 64 output + slack
 METHODS = [
     ("none", None),
     ("ngram", SMOKE_GAMMA),
+    ("eagle3", SMOKE_GAMMA),
+    ("draft_model", SMOKE_GAMMA),
 ]
 
 
@@ -43,7 +45,7 @@ def main():
     print(f"{'='*60}")
     print("Speculative Decoding Smoke Test")
     print(f"Dataset: {SMOKE_DATASET}  |  Prompts: {SMOKE_N_PROMPTS}")
-    print(f"Batch: {SMOKE_BATCH}  |  γ (ngram): {SMOKE_GAMMA}  |  max_out: {SMOKE_MAX_OUTPUT}")
+    print(f"Batch: {SMOKE_BATCH}  |  γ: {SMOKE_GAMMA}  |  max_out: {SMOKE_MAX_OUTPUT}")
     print(f"{'='*60}\n")
 
     print(f"Loading tokenizer from {MODEL_ID} ...")

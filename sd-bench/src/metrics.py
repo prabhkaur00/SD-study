@@ -145,7 +145,20 @@ def extract_preemption_count(metrics: list) -> int:
 # Speculative-decode stats — V1 engine (vLLM 0.6+)
 # ---------------------------------------------------------------------------
 
-def extract_spec_decode_stats_v1(metrics: list) -> dict:
+def _hist_buckets_per_pos(m, num_positions):
+    if m is None or num_positions is None:
+        return []
+    buckets = getattr(m, "buckets", {}) or {}
+    out = []
+    prev = 0
+    for i in range(num_positions):
+        cum = int(buckets.get(str(i), prev))
+        out.append(cum - prev)
+        prev = cum
+    return out
+
+
+def extract_spec_decode_stats_v1(metrics: list, gamma=None) -> dict:
     """
     Extract spec-decode counters from the metrics list.
     Takes the list directly so the caller can share one get_metrics() call
@@ -203,6 +216,15 @@ def extract_spec_decode_stats_v1(metrics: list) -> dict:
             and not math.isnan(num_accepted)):
         # +1: target model always emits one bonus token per draft round
         result["mean_accepted_length_per_step"] = 1.0 + num_accepted / num_drafts
+
+    pos_hist = _find_metric(metrics, "vllm:spec_decode_num_accepted_tokens_per_pos")
+    per_pos_count = _hist_buckets_per_pos(pos_hist, gamma)
+    per_pos_acceptance_rate = [
+        (c / num_drafts) if num_drafts else float("nan")
+        for c in per_pos_count
+    ]
+    result["per_pos_count"] = per_pos_count
+    result["per_pos_acceptance_rate"] = per_pos_acceptance_rate
 
     return result
 
