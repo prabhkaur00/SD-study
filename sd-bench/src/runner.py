@@ -127,13 +127,6 @@ def _build_llm(
             "num_speculative_tokens": gamma,
         }
         return LLM(**base, speculative_config=spec_cfg)
-    elif method == "draft_model":
-        spec_cfg = {
-            "method": "draft_model",
-            "model": "meta-llama/Llama-3.2-1B-Instruct",
-            "num_speculative_tokens": gamma,
-        }
-        return LLM(**base, speculative_config=spec_cfg)
     else:
         return LLM(**base)
 

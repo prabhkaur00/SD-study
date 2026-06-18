@@ -28,7 +28,6 @@ METHODS = [
     ("none", None),
     ("ngram", SMOKE_GAMMA),
     ("eagle3", SMOKE_GAMMA),
-    ("draft_model", SMOKE_GAMMA),
 ]
 
 
