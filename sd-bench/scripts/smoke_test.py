@@ -97,33 +97,48 @@ def main():
             print(f"\nPrompt {i}: \"{prompt_preview}...\"")
             print(f"  → Generated: \"{gen_text}...\"")
 
-        # Speculative decoding stats (aggregate; per-request not exposed by vLLM offline API)
+        # Speculative decoding stats
         drafted = row.get("total_drafted_tokens", math.nan)
         accepted = row.get("total_accepted_tokens", math.nan)
         ar = row.get("acceptance_rate", math.nan)
+        mean_len = row.get("mean_accepted_length_per_step", math.nan)
 
         print()
         if not math.isnan(drafted):
             ar_pct = f"{ar*100:.1f}%" if not math.isnan(ar) else "N/A"
+            mean_len_str = f"  mean_accepted_len={mean_len:.2f}" if not math.isnan(mean_len) else ""
             print(
-                f"  Proposed: {int(drafted)} | "
-                f"Accepted: {int(accepted)} | "
-                f"Acceptance: {ar_pct}"
+                f"  Proposed: {int(drafted)} | Accepted: {int(accepted)} | "
+                f"Acceptance: {ar_pct}{mean_len_str}"
             )
         else:
-            print(
-                "  Proposed: N/A | Accepted: N/A | Acceptance: N/A"
-                "  (SD stats not exposed via LLMEngine in this vLLM build)"
-            )
+            print("  Proposed: N/A | Accepted: N/A | Acceptance: N/A  (method=none or SD counters not exposed)")
 
+        # Throughput + KV cache
         tps = row.get("throughput_tok_per_sec", math.nan)
-        peak_kv = row.get("peak_kv_cache_usage_pct", math.nan)
-        kv_str = f"{peak_kv:.0f}%" if not math.isnan(peak_kv) else "N/A"
-        print(f"  Throughput: {_fmt(tps)} tok/s | Peak KV: {kv_str}")
-        print(f"  Latency p50: {_fmt(row.get('p50_latency_sec', math.nan), '.3f')}s  "
-              f"p95: {_fmt(row.get('p95_latency_sec', math.nan), '.3f')}s")
-        print(f"  TTFT mean:   {_fmt(row.get('mean_ttft_sec', math.nan), '.3f')}s")
-        print(f"  Total output tokens: {row.get('total_output_tokens', 'N/A')}")
+        peak_kv = row.get("peak_kv_usage_pct", math.nan)
+        mean_kv = row.get("mean_kv_usage_pct", math.nan)
+        kv_n = row.get("kv_n_samples", 0)
+        peak_str = f"{peak_kv:.1f}%" if not math.isnan(peak_kv) else "N/A"
+        mean_str = f"{mean_kv:.1f}%" if not math.isnan(mean_kv) else "N/A"
+        print(f"  Throughput: {_fmt(tps)} tok/s | Peak KV: {peak_str} (mean {mean_str}, {kv_n} samples)")
+
+        # Latency from histograms
+        print(f"  TTFT  mean={_fmt(row.get('ttft_mean_sec', math.nan), '.3f')}s  "
+              f"p50={_fmt(row.get('ttft_p50_sec', math.nan), '.3f')}s  "
+              f"p95={_fmt(row.get('ttft_p95_sec', math.nan), '.3f')}s")
+        print(f"  e2e   mean={_fmt(row.get('e2e_mean_sec', math.nan), '.3f')}s  "
+              f"p50={_fmt(row.get('e2e_p50_sec', math.nan), '.3f')}s  "
+              f"p95={_fmt(row.get('e2e_p95_sec', math.nan), '.3f')}s")
+
+        # Per-request time breakdown
+        print(f"  Prefill: {_fmt(row.get('prefill_time_mean_sec', math.nan), '.3f')}s  "
+              f"Decode: {_fmt(row.get('decode_time_mean_sec', math.nan), '.3f')}s  "
+              f"Queue: {_fmt(row.get('queue_time_mean_sec', math.nan), '.3f')}s")
+
+        print(f"  Output tokens: {row.get('total_output_tokens', 'N/A')}  "
+              f"(mean {_fmt(row.get('mean_generation_length', math.nan), '.1f')} "
+              f"± {_fmt(row.get('std_generation_length', math.nan), '.1f')})")
         print(f"  Wall time: {_fmt(row.get('total_wall_time_sec', math.nan), '.2f')}s")
 
         results[method] = row

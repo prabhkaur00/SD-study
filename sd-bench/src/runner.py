@@ -3,12 +3,72 @@ import gc
 import json
 import math
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 MODEL_ID = os.environ.get("HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 
+
+# ---------------------------------------------------------------------------
+# KV cache poller — samples gpu_cache_usage_perc during generation
+# ---------------------------------------------------------------------------
+
+class KVPoller:
+    """
+    Polls vllm:gpu_cache_usage_perc in a background thread during generation
+    to capture peak/mean KV usage.  The gauge drops to ~0 once generation
+    finishes, so we must sample while the run is in progress.
+    """
+    def __init__(self, llm, interval_sec: float = 0.05):
+        self.llm = llm
+        self.interval = interval_sec
+        self.samples: list = []
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                for m in self.llm.get_metrics():
+                    if getattr(m, "name", None) == "vllm:gpu_cache_usage_perc":
+                        v = getattr(m, "value", None)
+                        if v is not None:
+                            self.samples.append(float(v))
+                        break
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
+
+    def __enter__(self):
+        self.samples = []
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+    def summary(self) -> dict:
+        s = [v for v in self.samples if not math.isnan(v)]
+        if not s:
+            return {"peak_kv_usage_pct": float("nan"),
+                    "mean_kv_usage_pct": float("nan"),
+                    "kv_n_samples": 0,
+                    "kv_samples": []}
+        return {"peak_kv_usage_pct": max(s) * 100.0,
+                "mean_kv_usage_pct": sum(s) / len(s) * 100.0,
+                "kv_n_samples": len(s),
+                "kv_samples": s}
+
+
+# ---------------------------------------------------------------------------
+# Engine builder
+# ---------------------------------------------------------------------------
 
 def _build_llm(
     method: str,
@@ -19,9 +79,10 @@ def _build_llm(
     max_num_seqs: int,
 ):
     """
-    Create a vLLM LLM instance (not LLMEngine) so that get_metrics() is
-    available for V1 spec-decode stats.  Probes the constructor signature
-    before passing each optional kwarg so version-specific removals don't crash.
+    Create a vLLM LLM instance.  Uses the LLM class (not LLMEngine) so that
+    get_metrics() is available for V1 spec-decode and latency stats.
+    Probes the constructor signature before passing optional kwargs so that
+    version-specific removals don't crash.
     """
     from vllm import LLM
     import inspect
@@ -37,8 +98,8 @@ def _build_llm(
         "gpu_memory_utilization": gpu_util,
         "max_num_seqs": max_num_seqs,
         "trust_remote_code": False,
-        **_maybe("dtype", "float16"),         # T4 prefers fp16 over bfloat16
-        **_maybe("disable_log_stats", False),
+        "disable_log_stats": False,  # keep stats collection enabled
+        **_maybe("dtype", "float16"),  # T4 prefers fp16 over bfloat16
     }
 
     if method == "ngram":
@@ -63,6 +124,10 @@ def _build_llm(
         return LLM(**base)
 
 
+# ---------------------------------------------------------------------------
+# Main run function
+# ---------------------------------------------------------------------------
+
 def run_one(
     run_id: str,
     method: str,
@@ -83,9 +148,21 @@ def run_one(
     """
     from vllm import SamplingParams
     try:
-        from src.metrics import build_metrics_row, extract_spec_decode_stats_v1, extract_kv_usage_from_engine
+        from src.metrics import (
+            build_metrics_row,
+            extract_spec_decode_stats_v1,
+            extract_latency_stats,
+            extract_time_breakdown,
+            extract_preemption_count,
+        )
     except ModuleNotFoundError:
-        from metrics import build_metrics_row, extract_spec_decode_stats_v1, extract_kv_usage_from_engine  # type: ignore
+        from metrics import (  # type: ignore
+            build_metrics_row,
+            extract_spec_decode_stats_v1,
+            extract_latency_stats,
+            extract_time_breakdown,
+            extract_preemption_count,
+        )
 
     llm = _build_llm(method, gamma, model_id, max_model_len, gpu_util, batch_size)
 
@@ -95,29 +172,27 @@ def run_one(
         ignore_eos=False,
     )
 
-    # LLM.generate() preserves input order, so zip(prompts, outputs) is safe
+    # LLM.generate() preserves input order → zip(prompts, outputs) is safe
     prompt_texts = [p["text"] for p in prompts]
 
-    t0 = time.perf_counter()
-    outputs = llm.generate(prompt_texts, sampling_params)
-    wall_time = time.perf_counter() - t0
+    # Poll KV usage during generation (gauge drops to ~0 after run finishes)
+    with KVPoller(llm, interval_sec=0.05) as kv_poller:
+        t0 = time.perf_counter()
+        outputs = llm.generate(prompt_texts, sampling_params)
+        wall_time = time.perf_counter() - t0
 
-    # Pull spec-decode stats while the model is still loaded (cumulative since init)
-    sd_stats = extract_spec_decode_stats_v1(llm)
+    kv_summary = kv_poller.summary()
 
-    # Single KV cache sample post-generation via the underlying engine
-    step_kv_usages = []
-    try:
-        engine = getattr(llm, "llm_engine", None)
-        if engine is not None:
-            kv = extract_kv_usage_from_engine(engine)
-            if not math.isnan(kv):
-                step_kv_usages = [kv]
-    except Exception:
-        pass
+    # Single get_metrics() call — shared across all post-run extractors
+    raw_metrics = llm.get_metrics()
+
+    sd_stats = extract_spec_decode_stats_v1(raw_metrics)
+    latency_stats = extract_latency_stats(raw_metrics)
+    breakdown_stats = extract_time_breakdown(raw_metrics)
+    num_preemptions = extract_preemption_count(raw_metrics)
 
     if raw_dir is not None:
-        _write_raw(run_id, prompts, outputs, step_kv_usages, raw_dir)
+        _write_raw(run_id, prompts, outputs, kv_poller.samples, raw_dir)
 
     row = build_metrics_row(
         run_id=run_id,
@@ -129,7 +204,10 @@ def run_one(
         wall_time=wall_time,
         outputs=outputs,
         sd_stats=sd_stats,
-        step_kv_usages=step_kv_usages,
+        kv_summary=kv_summary,
+        latency_stats=latency_stats,
+        breakdown_stats=breakdown_stats,
+        num_preemptions=num_preemptions,
     )
 
     del llm
@@ -143,11 +221,15 @@ def run_one(
     return row, outputs
 
 
+# ---------------------------------------------------------------------------
+# Raw JSON writer
+# ---------------------------------------------------------------------------
+
 def _write_raw(
     run_id: str,
     prompts: list,
     outputs: list,
-    step_kv_usages: list,
+    kv_samples: list,
     raw_dir: Path,
 ) -> None:
     raw_dir = Path(raw_dir)
@@ -155,20 +237,19 @@ def _write_raw(
 
     per_request = []
     for p, out in zip(prompts, outputs):
-        m = getattr(out, "metrics", None)
-        arrival = getattr(m, "arrival_time", None) if m else None
-        finished = getattr(m, "finished_time", None) if m else None
-        first_tok = getattr(m, "first_token_time", None) if m else None
         gen_len = sum(len(o.token_ids) for o in out.outputs)
         per_request.append({
             "prompt_id": p["prompt_id"],
             "input_len": p["input_len"],
             "output_len": gen_len,
-            "latency": (finished - arrival) if (arrival and finished) else None,
-            "ttft": (first_tok - arrival) if (arrival and first_tok) else None,
-            "accepted_length_per_step_list": [],  # not exposed by vLLM offline API
+            # RequestOutput.metrics is None in V1 offline mode;
+            # per-request latency comes from engine-level histograms
+            "accepted_length_per_step_list": [],
         })
 
     with open(raw_dir / f"{run_id}.json", "w") as f:
-        json.dump({"run_id": run_id, "per_request": per_request,
-                   "kv_utilization_timeseries": step_kv_usages}, f, indent=2)
+        json.dump({
+            "run_id": run_id,
+            "per_request": per_request,
+            "kv_utilization_timeseries": kv_samples,
+        }, f, indent=2)

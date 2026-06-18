@@ -28,16 +28,26 @@ RAW_DIR = RESULTS_DIR / "raw"
 CSV_FIELDS = [
     "run_id", "method", "gamma", "batch_size", "dataset", "n_prompts",
     "timestamp", "vllm_version", "gpu_name",
+    # Throughput
     "throughput_tok_per_sec", "baseline_throughput_tok_per_sec", "speedup",
     "total_output_tokens", "total_wall_time_sec",
+    # Speculative decoding acceptance
     "total_drafted_tokens", "total_accepted_tokens", "acceptance_rate",
     "mean_accepted_length_per_step", "accepted_length_std",
     "accepted_length_p5", "accepted_length_p50", "accepted_length_p95",
+    # SD time fractions (NaN in vLLM 0.10.x)
     "time_drafting_frac", "time_verification_frac",
     "time_sampling_frac", "time_overhead_frac",
-    "peak_kv_cache_usage_pct", "mean_kv_cache_usage_pct", "num_preemptions",
-    "mean_per_request_latency_sec", "p50_latency_sec",
-    "p95_latency_sec", "p99_latency_sec", "mean_ttft_sec",
+    # KV cache (from KVPoller)
+    "peak_kv_usage_pct", "mean_kv_usage_pct", "kv_n_samples", "num_preemptions",
+    # Latency from histograms (TTFT / e2e / TPOT)
+    "ttft_mean_sec", "ttft_p50_sec", "ttft_p95_sec", "ttft_p99_sec",
+    "e2e_mean_sec", "e2e_p50_sec", "e2e_p95_sec", "e2e_p99_sec",
+    "tpot_mean_sec", "tpot_p50_sec", "tpot_p95_sec", "tpot_p99_sec",
+    # Per-request time breakdown
+    "prefill_time_mean_sec", "decode_time_mean_sec",
+    "queue_time_mean_sec", "inference_time_mean_sec",
+    # Generation length
     "mean_generation_length", "std_generation_length",
     "status", "error_msg",
 ]
