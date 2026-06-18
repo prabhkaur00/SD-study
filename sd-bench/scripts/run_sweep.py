@@ -99,25 +99,46 @@ def _csv_val(v):
 # ---------------------------------------------------------------------------
 
 def build_sweep(cfg: dict) -> list:
-    """Expand the YAML config into a flat list of run specs (dicts)."""
+    """Expand the YAML config into a flat list of run specs (dicts).
+
+    Order: dataset → gamma → batch_size → method.
+    The 'none' baseline (no gamma) is emitted once per (bs, ds) in the first
+    gamma pass so it runs before the SD methods at that batch size.
+    """
+    # Collect numeric gammas in first-appearance order across all methods
+    seen_g: set = set()
+    ordered_gammas: list = []
+    for method_cfg in cfg["methods"]:
+        for g in (method_cfg.get("gammas") or [None]):
+            if g is not None and g not in seen_g:
+                ordered_gammas.append(g)
+                seen_g.add(g)
+
     runs = []
     for ds in cfg["datasets"]:
-        for bs in cfg["batch_sizes"]:
-            for method_cfg in cfg["methods"]:
-                name = method_cfg["name"]
-                gammas = method_cfg.get("gammas") or [None]
-                for g in gammas:
+        for g in ordered_gammas:
+            for bs in cfg["batch_sizes"]:
+                for method_cfg in cfg["methods"]:
+                    name = method_cfg["name"]
+                    method_gammas = method_cfg.get("gammas") or [None]
                     if name == "none":
-                        run_id = f"none_b{bs}_{ds}"
-                    else:
-                        run_id = f"{name}_g{g}_b{bs}_{ds}"
-                    runs.append({
-                        "run_id": run_id,
-                        "method": name,
-                        "gamma": g,
-                        "batch_size": bs,
-                        "dataset": ds,
-                    })
+                        # Emit baseline once per (bs, ds) in the first gamma pass
+                        if g == ordered_gammas[0]:
+                            runs.append({
+                                "run_id": f"none_b{bs}_{ds}",
+                                "method": name,
+                                "gamma": None,
+                                "batch_size": bs,
+                                "dataset": ds,
+                            })
+                    elif g in method_gammas:
+                        runs.append({
+                            "run_id": f"{name}_g{g}_b{bs}_{ds}",
+                            "method": name,
+                            "gamma": g,
+                            "batch_size": bs,
+                            "dataset": ds,
+                        })
     return runs
 
 

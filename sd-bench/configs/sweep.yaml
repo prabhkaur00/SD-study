@@ -19,8 +19,8 @@ methods:
 batch_sizes: [1, 8, 32, 64]
 
 datasets:
-  - instructcoder
   - sharegpt
+  - instructcoder
 
 # ngram-specific (carried here for documentation; set in runner.py)
 prompt_lookup_max: 7
