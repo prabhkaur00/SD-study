@@ -261,7 +261,7 @@ def main():
 
             ar = row.get("acceptance_rate", math.nan)
             tps = row.get("throughput_tok_per_sec", math.nan)
-            peak_kv = row.get("peak_kv_cache_usage_pct", math.nan)
+            peak_kv = row.get("peak_kv_usage_pct", math.nan)
 
             ar_str = f"α={ar:.2f}" if not math.isnan(ar) else "α=N/A"
             kv_str = f"peak_kv={peak_kv:.0f}%" if not math.isnan(peak_kv) else "peak_kv=N/A"
