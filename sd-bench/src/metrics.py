@@ -91,7 +91,7 @@ def extract_kv_snapshot(metrics: list) -> float:
     Will be ~0 after generation finishes; use KVPoller in runner.py for
     peak/mean captured during generation.
     """
-    m = _find_metric(metrics, "vllm:gpu_cache_usage_perc")
+    m = _find_metric(metrics, "vllm:kv_cache_usage_perc")
     return float(getattr(m, "value", _NAN)) if m else _NAN
 
 

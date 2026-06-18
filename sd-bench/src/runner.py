@@ -12,12 +12,12 @@ MODEL_ID = os.environ.get("HF_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 
 
 # ---------------------------------------------------------------------------
-# KV cache poller — samples gpu_cache_usage_perc during generation
+# KV cache poller — samples kv_cache_usage_perc during generation
 # ---------------------------------------------------------------------------
 
 class KVPoller:
     """
-    Polls vllm:gpu_cache_usage_perc in a background thread during generation
+    Polls vllm:kv_cache_usage_perc in a background thread during generation
     to capture peak/mean KV usage.  The gauge drops to ~0 once generation
     finishes, so we must sample while the run is in progress.
     """
@@ -32,7 +32,7 @@ class KVPoller:
         while not self._stop.is_set():
             try:
                 for m in self.llm.get_metrics():
-                    if getattr(m, "name", None) == "vllm:gpu_cache_usage_perc":
+                    if getattr(m, "name", None) == "vllm:kv_cache_usage_perc":
                         v = getattr(m, "value", None)
                         if v is not None:
                             self.samples.append(float(v))
